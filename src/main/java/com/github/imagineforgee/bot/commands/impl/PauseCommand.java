@@ -1,4 +1,4 @@
-package com.github.imagineforgee.commands.impl;
+package com.github.imagineforgee.bot.commands.impl;
 
 import com.clawsoftstudios.purrfectlib.annotations.Command;
 import com.github.imagineforgee.commands.CommandContext;

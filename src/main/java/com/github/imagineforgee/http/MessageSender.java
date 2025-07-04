@@ -1,6 +1,5 @@
 package com.github.imagineforgee.http;
 
-import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import okhttp3.*;
 
@@ -17,13 +16,17 @@ public class MessageSender {
         this.token = token;
     }
 
+    /**
+     * Basic text message send.
+     */
     public CompletableFuture<Void> sendMessage(String channelId, String content) {
         return sendMessage(channelId, content, null);
     }
 
+    /**
+     * Text message with optional reply.
+     */
     public CompletableFuture<Void> sendMessage(String channelId, String content, String replyToMsgId) {
-        CompletableFuture<Void> future = new CompletableFuture<>();
-
         JsonObject bodyJson = new JsonObject();
         bodyJson.addProperty("content", content);
 
@@ -33,6 +36,24 @@ public class MessageSender {
             reference.addProperty("channel_id", channelId);
             bodyJson.add("message_reference", reference);
         }
+
+        return executeRequest(channelId, bodyJson);
+    }
+
+    /**
+     * Send a fully-custom payload (e.g. poll, embed, attachment, etc).
+     * @param channelId the target channel
+     * @param payload   the exact JSON you want to POST under {"content", "poll", ...}
+     */
+    public CompletableFuture<Void> sendRawMessage(String channelId, JsonObject payload) {
+        return executeRequest(channelId, payload);
+    }
+
+    /**
+     * Internal helper to build & enqueue the HTTP request from a JsonObject.
+     */
+    private CompletableFuture<Void> executeRequest(String channelId, JsonObject bodyJson) {
+        CompletableFuture<Void> future = new CompletableFuture<>();
 
         RequestBody body = RequestBody.create(
                 bodyJson.toString(),
@@ -50,12 +71,11 @@ public class MessageSender {
             public void onFailure(Call call, IOException e) {
                 future.completeExceptionally(e);
             }
-
             @Override
             public void onResponse(Call call, Response response) throws IOException {
                 String resp = response.body() != null ? response.body().string() : "";
                 if (!response.isSuccessful()) {
-                    System.err.println("Discord error 400: " + resp);
+                    System.err.println("Discord error " + response.code() + ": " + resp);
                     future.completeExceptionally(new IOException("Failed: " + response.code()));
                 } else {
                     future.complete(null);

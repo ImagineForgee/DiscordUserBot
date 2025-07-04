@@ -88,6 +88,12 @@ public class UserBotClient {
         );
     }
 
+    public Mono<Void> sendRawMessage(String channelId, JsonObject object) {
+        return Mono.fromFuture(
+                messageSender.sendRawMessage(channelId, object)
+        );
+    }
+
     public Mono<Void> sendDm(String userId, String content) {
         return Mono.fromFuture(dmService.createDmChannel(userId))
                 .flatMap(channelId -> sendMessage(channelId, content));

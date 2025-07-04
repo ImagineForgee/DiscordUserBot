@@ -1,9 +1,12 @@
 package com.github.imagineforgee.client;
 
+import com.github.imagineforgee.voice.OpusUdpStreamer;
+import com.github.imagineforgee.voice.SpeakingFlag;
+import com.github.imagineforgee.voice.VoiceMode;
 import com.github.imagineforgee.dispatch.events.VoiceServerUpdateEvent;
 import com.github.imagineforgee.dispatch.events.VoiceStateUpdateEvent;
 import com.github.imagineforgee.gateway.GatewayClient;
-import com.github.imagineforgee.util.AudioPlayer;
+import com.github.imagineforgee.voice.LavaPlayer;
 import com.github.imagineforgee.util.VoiceStateRegistry;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
@@ -17,7 +20,6 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.publisher.Sinks;
 import reactor.core.scheduler.Schedulers;
-import reactor.util.retry.Retry;
 
 import java.net.*;
 import java.time.Duration;
@@ -40,16 +42,26 @@ public class VoiceClient {
 
     private volatile WebSocketClient voiceSocket;
     private volatile DatagramSocket udp;
-    private volatile AudioPlayer audioPlayer;
     private LazySodiumJava lazySodium;
+    private VoiceMode voiceMode;
 
-    public VoiceClient(UserBotClient botClient) {
+    public VoiceClient(UserBotClient botClient, VoiceMode initialVoiceMode) {
         this.botClient = botClient;
         this.gateway = botClient.getGatewayClient();
-
+        this.voiceMode = initialVoiceMode;
         setupReactiveEventHandling();
         setupHeartbeatHandling();
         setupVoiceMessageHandling();
+    }
+
+    public void setVoiceMode(VoiceMode newMode) {
+        if (this.voiceMode != null) {
+            this.voiceMode.stop();
+        }
+        this.voiceMode = newMode;
+        if (isConnected()) {
+            this.voiceMode.joinChannel(currentState.get().guildId, currentState.get().channelId);
+        }
     }
 
     private void setupReactiveEventHandling() {
@@ -377,7 +389,11 @@ public class VoiceClient {
                             .withServerUpdate(guildId, server.getToken(), server.getEndpoint());
 
                     currentState.set(full);
-                    return connectToVoiceWebSocket(full);
+                    return connectToVoiceWebSocket(full).then(Mono.fromRunnable(() -> {
+                        if (voiceMode != null) {
+                            voiceMode.joinChannel(guildId, channelId);
+                        }
+                    }));
                 });
     }
 
@@ -409,21 +425,21 @@ public class VoiceClient {
     }
 
     public void playTrack(String url) {
-        if (audioPlayer != null && isConnected.get()) {
-            System.out.println("[Voice] Playing track: " + url);
-            sendSpeaking(true);
-            audioPlayer.loadAndPlay(url);
+        if (voiceMode != null && isConnected()) {
+            System.out.println("[Voice] Delegating play to VoiceMode: " + voiceMode.getClass().getSimpleName());
+            voiceMode.start(url);
         } else {
-            System.err.println("[Voice] Cannot play - not connected or AudioPlayer not ready");
+            System.err.println("[Voice] Cannot play - not connected or VoiceMode is null");
         }
     }
 
     public void stop() {
-        if (audioPlayer != null) {
-            sendSpeaking(false);
-            audioPlayer.stop();
+        if (voiceMode != null) {
+            System.out.println("[Voice] Delegating stop to VoiceMode: " + voiceMode.getClass().getSimpleName());
+            voiceMode.stop();
         }
     }
+
 
     public Mono<Void> debugStatus() {
         return Mono.fromRunnable(() -> {
@@ -434,7 +450,7 @@ public class VoiceClient {
             System.out.println("[Voice] State: " + state);
             System.out.println("[Voice] WebSocket open: " + (voiceSocket != null && voiceSocket.isOpen()));
             System.out.println("[Voice] UDP closed: " + (udp == null || udp.isClosed()));
-            System.out.println("[Voice] AudioPlayer ready: " + (audioPlayer != null));
+            System.out.println("[Voice] AudioPlayer ready: " + (voiceMode != null));
             System.out.println("[Voice] ========================");
         });
     }
@@ -490,7 +506,7 @@ public class VoiceClient {
         }
 
         VoiceConnectionState state = currentState.get();
-        System.out.println("[Voice] Received encryption key, initializing audio");
+        System.out.println("[Voice] Received encryption key, initializing voice");
 
         if (lazySodium == null) {
             lazySodium = new LazySodiumJava(new SodiumJava());
@@ -498,27 +514,35 @@ public class VoiceClient {
 
         try {
             InetAddress address = InetAddress.getByName(state.voiceServerIp);
-            audioPlayer = new AudioPlayer(lazySodium, udp, isConnected, state.ssrc,
-                    secretKey, address, state.voiceServerPort);
+            OpusUdpStreamer streamer = new OpusUdpStreamer(lazySodium, udp, address, state.voiceServerPort, state.ssrc, secretKey, isConnected);
+            LavaPlayer player = new LavaPlayer(this, streamer);
             System.out.println("[Voice] Voice connection fully established");
         } catch (Exception e) {
             System.err.println("[Voice] Failed to initialize AudioPlayer: " + e.getMessage());
         }
     }
 
-    private void sendSpeaking(boolean speaking) {
+    public void setSpeaking(SpeakingFlag... flags) {
         if (voiceSocket != null && voiceSocket.isOpen()) {
+            int speakingMask = 0;
+            for (SpeakingFlag flag : flags) {
+                speakingMask |= flag.getBit();
+            }
+
             VoiceConnectionState state = currentState.get();
             JsonObject payload = new JsonObject();
             payload.addProperty("op", 5);
             JsonObject d = new JsonObject();
-            d.addProperty("speaking", speaking ? 1 : 0);
+            d.addProperty("speaking", speakingMask);
             d.addProperty("delay", 0);
             d.addProperty("ssrc", state.ssrc);
             payload.add("d", d);
             voiceSocket.send(payload.toString());
+
+            System.out.println("[Voice] Sent speaking packet with flags: " + speakingMask);
         }
     }
+
 
     private void cleanup() {
         if (voiceSocket != null && voiceSocket.isOpen()) {
@@ -528,9 +552,9 @@ public class VoiceClient {
             udp.close();
             udp = null;
         }
-        if (audioPlayer != null) {
-            audioPlayer.stop();
-            audioPlayer = null;
+        if (voiceMode != null) {
+            voiceMode.stop();
+            voiceMode = null;
         }
     }
 

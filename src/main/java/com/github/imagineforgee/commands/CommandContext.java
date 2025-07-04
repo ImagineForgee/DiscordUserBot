@@ -36,7 +36,7 @@ public class CommandContext {
         return voiceChannelId;
     }
 
-    public String getUserId() {
+    public String getAuthorId() {
         return userId;
     }
 

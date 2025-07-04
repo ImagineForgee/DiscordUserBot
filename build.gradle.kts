@@ -3,7 +3,7 @@ plugins {
 }
 
 group = "com.github.imagineforgee"
-version = "1.0-SNAPSHOT"
+version = "0.0.1"
 var opusVersions = "1.1.1"
 
 repositories {
@@ -29,4 +29,14 @@ dependencies {
     implementation("club.minnced:opus-java-api:${opusVersions}")
     implementation("club.minnced:opus-java-natives:${opusVersions}")
     implementation("club.minnced:opus-java:${opusVersions}")
+}
+
+tasks.jar {
+    manifest {
+        attributes["Main-Class"] = "com.github.imagineforgee.bot.Main"
+    }
+    from({
+        configurations.runtimeClasspath.get().filter { it.name.endsWith("jar") }.map { zipTree(it) }
+    })
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }

@@ -1,6 +1,7 @@
 package com.github.imagineforgee.commands;
 
 import com.clawsoftstudios.purrfectlib.scanner.CommandInfo;
+import com.github.imagineforgee.bot.util.Blacklist;
 
 import java.lang.reflect.InvocationTargetException;
 import java.util.HashMap;
@@ -18,6 +19,18 @@ public class CommandManager {
     }
 
     public void handleCommand(String commandName, String args, CommandContext context) {
+        String userId  = context.getAuthorId();
+        String guildId = context.getGuildId();
+
+        if (Blacklist.isUserBlacklisted(userId)) {
+            context.reply("⛔ You are blacklisted from using this bot.");
+            return;
+        }
+        if (guildId != null && Blacklist.isGuildBlacklisted(guildId)) {
+            context.reply("⛔ Commands are disabled in this server.");
+            return;
+        }
+
         CommandInfo cmd = commands.get(commandName);
         if (cmd == null) {
             context.reply("Unknown command: " + commandName);
