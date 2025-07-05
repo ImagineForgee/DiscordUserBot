@@ -1,13 +1,14 @@
 package com.github.imagineforgee.client;
 
-import com.github.imagineforgee.voice.OpusUdpStreamer;
-import com.github.imagineforgee.voice.SpeakingFlag;
-import com.github.imagineforgee.voice.VoiceMode;
 import com.github.imagineforgee.dispatch.events.VoiceServerUpdateEvent;
 import com.github.imagineforgee.dispatch.events.VoiceStateUpdateEvent;
 import com.github.imagineforgee.gateway.GatewayClient;
-import com.github.imagineforgee.voice.LavaPlayer;
 import com.github.imagineforgee.util.VoiceStateRegistry;
+import com.github.imagineforgee.video.VideoMode;
+import com.github.imagineforgee.voice.OpusUdpStreamer;
+import com.github.imagineforgee.voice.SpeakingFlag;
+import com.github.imagineforgee.voice.VoiceConnectionState;
+import com.github.imagineforgee.voice.VoiceMode;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
@@ -21,8 +22,16 @@ import reactor.core.publisher.Mono;
 import reactor.core.publisher.Sinks;
 import reactor.core.scheduler.Schedulers;
 
-import java.net.*;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
+import java.net.URI;
 import java.time.Duration;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -38,29 +47,191 @@ public class VoiceClient {
     private final AtomicReference<VoiceConnectionState> currentState = new AtomicReference<>(new VoiceConnectionState());
     private final AtomicBoolean isConnecting = new AtomicBoolean(false);
     private final AtomicBoolean isConnected = new AtomicBoolean(false);
+    private final AtomicBoolean initialized = new AtomicBoolean(false);
     private final AtomicInteger heartbeatSequence = new AtomicInteger(0);
+
+    private final Map<String, VoiceMode> voiceModes = new ConcurrentHashMap<>();
+    private final Map<String, VideoMode> videoModes = new ConcurrentHashMap<>();
+    private final AtomicReference<String> activeVoiceModeId = new AtomicReference<>();
+    private final AtomicReference<String> activeVideoModeId = new AtomicReference<>();
 
     private volatile WebSocketClient voiceSocket;
     private volatile DatagramSocket udp;
     private LazySodiumJava lazySodium;
-    private VoiceMode voiceMode;
+    private OpusUdpStreamer udpStreamer;
 
-    public VoiceClient(UserBotClient botClient, VoiceMode initialVoiceMode) {
+    public VoiceClient(UserBotClient botClient) {
         this.botClient = botClient;
         this.gateway = botClient.getGatewayClient();
-        this.voiceMode = initialVoiceMode;
         setupReactiveEventHandling();
         setupHeartbeatHandling();
         setupVoiceMessageHandling();
     }
 
-    public void setVoiceMode(VoiceMode newMode) {
-        if (this.voiceMode != null) {
-            this.voiceMode.stop();
+    public void registerVoiceMode(String modeId, VoiceMode voiceMode) {
+        VoiceMode existing = voiceModes.put(modeId, voiceMode);
+        if (existing != null) {
+            System.out.println("[Voice] Replaced existing voice mode: " + modeId);
         }
-        this.voiceMode = newMode;
-        if (isConnected()) {
-            this.voiceMode.joinChannel(currentState.get().guildId, currentState.get().channelId);
+        System.out.println("[Voice] Registered voice mode: " + modeId + " (" + voiceMode.getClass().getSimpleName() + ")");
+    }
+
+    public void registerVideoMode(String modeId, VideoMode videoMode) {
+        VideoMode existing = videoModes.put(modeId, videoMode);
+        if (existing != null) {
+            System.out.println("[Voice] Replaced existing video mode: " + modeId);
+            cleanupVideoMode(existing);
+        }
+        System.out.println("[Voice] Registered video mode: " + modeId + " (" + videoMode.getClass().getSimpleName() + ")");
+    }
+
+    public void switchToVoiceMode(String modeId) {
+        VoiceMode newMode = voiceModes.get(modeId);
+        if (newMode == null) {
+            System.err.println("[Voice] Voice mode not found: " + modeId);
+            return;
+        }
+
+        String currentModeId = activeVoiceModeId.get();
+        if (modeId.equals(currentModeId)) {
+            System.out.println("[Voice] Already using voice mode: " + modeId);
+            return;
+        }
+
+        if (currentModeId != null) {
+            VoiceMode currentMode = voiceModes.get(currentModeId);
+            if (currentMode != null) {
+                try {
+                    currentMode.stop();
+                    System.out.println("[Voice] Stopped voice mode: " + currentModeId);
+                } catch (Exception e) {
+                    System.err.println("[Voice] Error stopping voice mode " + currentModeId + ": " + e.getMessage());
+                }
+            }
+        }
+
+        try {
+            activeVoiceModeId.set(modeId);
+            VoiceConnectionState state = currentState.get();
+
+            if (isConnected.get() && state.channelId != null) {
+                newMode.joinChannel(state.guildId, state.channelId);
+
+                if (udpStreamer != null) {
+                    newMode.setUdpStreamer(udpStreamer);
+                }
+            }
+
+            System.out.println("[Voice] Switched to voice mode: " + modeId);
+        } catch (Exception e) {
+            System.err.println("[Voice] Error switching to voice mode " + modeId + ": " + e.getMessage());
+            activeVoiceModeId.set(currentModeId);
+        }
+    }
+
+    public boolean switchToVideoMode(String modeId) {
+        VideoMode newMode = videoModes.get(modeId);
+        if (newMode == null) {
+            System.err.println("[Voice] Video mode not found: " + modeId);
+            return false;
+        }
+
+        String currentModeId = activeVideoModeId.get();
+        if (modeId.equals(currentModeId)) {
+            System.out.println("[Voice] Already using video mode: " + modeId);
+            return true;
+        }
+
+        if (currentModeId != null) {
+            VideoMode currentMode = videoModes.get(currentModeId);
+            if (currentMode != null) {
+                try {
+                    currentMode.stop();
+                    System.out.println("[Voice] Stopped video mode: " + currentModeId);
+                } catch (Exception e) {
+                    System.err.println("[Voice] Error stopping video mode " + currentModeId + ": " + e.getMessage());
+                }
+            }
+        }
+
+        try {
+            activeVideoModeId.set(modeId);
+            VoiceConnectionState state = currentState.get();
+
+            if (isConnected.get() && state.channelId != null) {
+                newMode.joinChannel(state.guildId, state.channelId);
+            }
+
+            System.out.println("[Voice] Switched to video mode: " + modeId);
+            return true;
+        } catch (Exception e) {
+            System.err.println("[Voice] Error switching to video mode " + modeId + ": " + e.getMessage());
+            activeVideoModeId.set(currentModeId);
+            return false;
+        }
+    }
+
+    public void unregisterVoiceMode(String modeId) {
+        VoiceMode mode = voiceModes.remove(modeId);
+        if (mode != null) {
+            if (modeId.equals(activeVoiceModeId.get())) {
+                activeVoiceModeId.set(null);
+            }
+            cleanupVoiceMode(mode);
+            System.out.println("[Voice] Unregistered voice mode: " + modeId);
+        }
+    }
+
+    public void unregisterVideoMode(String modeId) {
+        VideoMode mode = videoModes.remove(modeId);
+        if (mode != null) {
+            if (modeId.equals(activeVideoModeId.get())) {
+                activeVideoModeId.set(null);
+            }
+            cleanupVideoMode(mode);
+            System.out.println("[Voice] Unregistered video mode: " + modeId);
+        }
+    }
+
+    public Set<String> getRegisteredVoiceModes() {
+        return new HashSet<>(voiceModes.keySet());
+    }
+
+    public Set<String> getRegisteredVideoModes() {
+        return new HashSet<>(videoModes.keySet());
+    }
+
+    public String getActiveVoiceModeId() {
+        return activeVoiceModeId.get();
+    }
+
+    public String getActiveVideoModeId() {
+        return activeVideoModeId.get();
+    }
+
+    public VoiceMode getActiveVoiceMode() {
+        String modeId = activeVoiceModeId.get();
+        return modeId != null ? voiceModes.get(modeId) : null;
+    }
+
+    public VideoMode getActiveVideoMode() {
+        String modeId = activeVideoModeId.get();
+        return modeId != null ? videoModes.get(modeId) : null;
+    }
+
+    private void cleanupVoiceMode(VoiceMode mode) {
+        try {
+            mode.stop();
+        } catch (Exception e) {
+            System.err.println("[Voice] Error cleaning up voice mode: " + e.getMessage());
+        }
+    }
+
+    private void cleanupVideoMode(VideoMode mode) {
+        try {
+            mode.stop();
+        } catch (Exception e) {
+            System.err.println("[Voice] Error cleaning up video mode: " + e.getMessage());
         }
     }
 
@@ -193,6 +364,7 @@ public class VoiceClient {
                         System.out.println("[Voice] Disconnected: " + code + " - " + reason);
                         isConnected.set(false);
                         isConnecting.set(false);
+                        initialized.set(false);
 
                         handleDisconnection(code, reason, state)
                                 .subscribeOn(Schedulers.boundedElastic())
@@ -242,7 +414,6 @@ public class VoiceClient {
             }
         };
     }
-
 
     private void processVoiceMessage(JsonObject json) {
         int op = json.get("op").getAsInt();
@@ -390,14 +561,33 @@ public class VoiceClient {
 
                     currentState.set(full);
                     return connectToVoiceWebSocket(full).then(Mono.fromRunnable(() -> {
-                        if (voiceMode != null) {
-                            voiceMode.joinChannel(guildId, channelId);
-                        }
+                        notifyModesOfChannelJoin(guildId, channelId);
                     }));
                 });
     }
 
+    private void notifyModesOfChannelJoin(String guildId, String channelId) {
+        VoiceMode activeVoice = getActiveVoiceMode();
+        if (activeVoice != null && isConnected.get()) {
+            try {
+                activeVoice.joinChannel(guildId, channelId);
+                if (udpStreamer != null) {
+                    activeVoice.setUdpStreamer(udpStreamer);
+                }
+            } catch (Exception e) {
+                System.err.println("[Voice] Error notifying voice mode of channel join: " + e.getMessage());
+            }
+        }
 
+        VideoMode activeVideo = getActiveVideoMode();
+        if (activeVideo != null && isConnected.get()) {
+            try {
+                activeVideo.joinChannel(guildId, channelId);
+            } catch (Exception e) {
+                System.err.println("[Voice] Error notifying video mode of channel join: " + e.getMessage());
+            }
+        }
+    }
 
     public Mono<Void> leaveVoice(String guildId) {
         return disconnect()
@@ -419,27 +609,39 @@ public class VoiceClient {
         return Mono.fromRunnable(() -> {
             isConnected.set(false);
             isConnecting.set(false);
+            activeVoiceModeId.set(null);
+            activeVideoModeId.set(null);
+            initialized.set(false);
             currentState.set(new VoiceConnectionState());
             cleanup();
         });
     }
 
+
     public void playTrack(String url) {
-        if (voiceMode != null && isConnected()) {
-            System.out.println("[Voice] Delegating play to VoiceMode: " + voiceMode.getClass().getSimpleName());
-            voiceMode.start(url);
+        VoiceMode activeMode = getActiveVoiceMode();
+        System.out.println(activeVoiceModeId.get());
+        if (activeMode != null && isConnected.get()) {
+            System.out.println("[Voice] Delegating play to active VoiceMode: " + activeVoiceModeId.get());
+            activeMode.start(url);
         } else {
-            System.err.println("[Voice] Cannot play - not connected or VoiceMode is null");
+            System.err.println("[Voice] Cannot play - not connected or no active VoiceMode");
         }
     }
 
     public void stop() {
-        if (voiceMode != null) {
-            System.out.println("[Voice] Delegating stop to VoiceMode: " + voiceMode.getClass().getSimpleName());
-            voiceMode.stop();
+        VoiceMode activeVoice = getActiveVoiceMode();
+        if (activeVoice != null) {
+            System.out.println("[Voice] Stopping active VoiceMode: " + activeVoiceModeId.get());
+            activeVoice.stop();
+        }
+
+        VideoMode activeVideo = getActiveVideoMode();
+        if (activeVideo != null) {
+            System.out.println("[Voice] Stopping active VideoMode: " + activeVideoModeId.get());
+            activeVideo.stop();
         }
     }
-
 
     public Mono<Void> debugStatus() {
         return Mono.fromRunnable(() -> {
@@ -450,7 +652,11 @@ public class VoiceClient {
             System.out.println("[Voice] State: " + state);
             System.out.println("[Voice] WebSocket open: " + (voiceSocket != null && voiceSocket.isOpen()));
             System.out.println("[Voice] UDP closed: " + (udp == null || udp.isClosed()));
-            System.out.println("[Voice] AudioPlayer ready: " + (voiceMode != null));
+            System.out.println("[Voice] Active VoiceMode: " + activeVoiceModeId.get());
+            System.out.println("[Voice] Active VideoMode: " + activeVideoModeId.get());
+            System.out.println("[Voice] Registered VoiceModes: " + voiceModes.keySet());
+            System.out.println("[Voice] Registered VideoModes: " + videoModes.keySet());
+            System.out.println("[Voice] UDP Streamer ready: " + (udpStreamer != null));
             System.out.println("[Voice] ========================");
         });
     }
@@ -514,33 +720,49 @@ public class VoiceClient {
 
         try {
             InetAddress address = InetAddress.getByName(state.voiceServerIp);
-            OpusUdpStreamer streamer = new OpusUdpStreamer(lazySodium, udp, address, state.voiceServerPort, state.ssrc, secretKey, isConnected);
-            LavaPlayer player = new LavaPlayer(this, streamer);
+            udpStreamer = new OpusUdpStreamer(lazySodium, udp, address, state.voiceServerPort, state.ssrc, secretKey, isConnected);
+            System.out.println("[Voice] UDP Streamer initialized");
+
+            VoiceMode activeVoice = getActiveVoiceMode();
+            if (activeVoice != null) {
+                activeVoice.setUdpStreamer(udpStreamer);
+            }
+            initialized.set(true);
             System.out.println("[Voice] Voice connection fully established");
         } catch (Exception e) {
-            System.err.println("[Voice] Failed to initialize AudioPlayer: " + e.getMessage());
+            System.err.println("[Voice] Failed to initialize voice streamer: " + e.getMessage());
         }
     }
 
     public void setSpeaking(SpeakingFlag... flags) {
-        if (voiceSocket != null && voiceSocket.isOpen()) {
-            int speakingMask = 0;
-            for (SpeakingFlag flag : flags) {
-                speakingMask |= flag.getBit();
-            }
-
-            VoiceConnectionState state = currentState.get();
-            JsonObject payload = new JsonObject();
-            payload.addProperty("op", 5);
-            JsonObject d = new JsonObject();
-            d.addProperty("speaking", speakingMask);
-            d.addProperty("delay", 0);
-            d.addProperty("ssrc", state.ssrc);
-            payload.add("d", d);
-            voiceSocket.send(payload.toString());
-
-            System.out.println("[Voice] Sent speaking packet with flags: " + speakingMask);
+        if (!isConnected.get() || voiceSocket == null || !voiceSocket.isOpen()) {
+            System.err.println("[Voice] Cannot set speaking - not connected");
+            return;
         }
+
+        VoiceConnectionState state = currentState.get();
+        if (state.ssrc == 0) {
+            System.err.println("[Voice] Cannot set speaking - SSRC not set");
+            return;
+        }
+
+        int bitmask = 0;
+        for (SpeakingFlag flag : flags) {
+            bitmask |= flag.getBit();
+        }
+
+        JsonObject payload = new JsonObject();
+        payload.addProperty("op", 5);
+
+        JsonObject data = new JsonObject();
+        data.addProperty("speaking", bitmask);
+        data.addProperty("delay", 0);
+        data.addProperty("ssrc", state.ssrc);
+
+        payload.add("d", data);
+        voiceSocket.send(payload.toString());
+
+        System.out.println("[Voice] Set speaking: " + (bitmask != 0 ? bitmask : "off") + " (" + Arrays.toString(flags) + ")");
     }
 
 
@@ -552,105 +774,36 @@ public class VoiceClient {
             udp.close();
             udp = null;
         }
-        if (voiceMode != null) {
-            voiceMode.stop();
-            voiceMode = null;
+
+        if (udpStreamer != null) {
+            udpStreamer.stop();
+            udpStreamer = null;
+        }
+
+        if (initialized.getAndSet(false)) {
+            VoiceMode activeVoice = getActiveVoiceMode();
+            if (activeVoice != null) {
+                activeVoice.shutdown();
+            }
+
+            VideoMode activeVideo = getActiveVideoMode();
+            if (activeVideo != null) {
+                activeVideo.shutdown();
+            }
+        } else {
+            System.out.println("[Voice] Skipped mode shutdown: not yet initialized");
         }
     }
 
-    public boolean isConnected() {
-        return isConnected.get() && voiceSocket != null && voiceSocket.isOpen();
+    public AtomicBoolean getIsConnected() {
+        return isConnected;
     }
 
-    private static class VoiceConnectionState {
-        final String guildId;
-        final String channelId;
-        final String sessionId;
-        final String token;
-        final String endpoint;
-        final int ssrc;
-        final String voiceServerIp;
-        final int voiceServerPort;
-        final boolean hasServerUpdate;
-        final boolean hasStateUpdate;
+    public AtomicBoolean getInitialized() {
+        return initialized;
+    }
 
-        public VoiceConnectionState() {
-            this(null, null, null, null, null, 0, null, 0, false, false);
-        }
-
-        private VoiceConnectionState(String guildId, String channelId, String sessionId,
-                                     String token, String endpoint, int ssrc,
-                                     String voiceServerIp, int voiceServerPort,
-                                     boolean hasServerUpdate, boolean hasStateUpdate) {
-            this.guildId = guildId;
-            this.channelId = channelId;
-            this.sessionId = sessionId;
-            this.token = token;
-            this.endpoint = endpoint;
-            this.ssrc = ssrc;
-            this.voiceServerIp = voiceServerIp;
-            this.voiceServerPort = voiceServerPort;
-            this.hasServerUpdate = hasServerUpdate;
-            this.hasStateUpdate = hasStateUpdate;
-        }
-
-        public VoiceConnectionState withServerUpdate(String guildId, String token, String endpoint) {
-            return new VoiceConnectionState(guildId, this.channelId, this.sessionId,
-                    token, endpoint, this.ssrc, this.voiceServerIp,
-                    this.voiceServerPort, true, this.hasStateUpdate);
-        }
-
-        public VoiceConnectionState withStateUpdate(String guildId, String channelId, String sessionId) {
-            return new VoiceConnectionState(guildId, channelId, sessionId, this.token,
-                    this.endpoint, this.ssrc, this.voiceServerIp,
-                    this.voiceServerPort, this.hasServerUpdate, true);
-        }
-
-        public VoiceConnectionState withVoiceReady(int ssrc, String ip, int port) {
-            return new VoiceConnectionState(this.guildId, this.channelId, this.sessionId,
-                    this.token, this.endpoint, ssrc, ip, port,
-                    this.hasServerUpdate, this.hasStateUpdate);
-        }
-
-        public VoiceConnectionState withTargetChannel(String guildId, String channelId) {
-            return new VoiceConnectionState(guildId, channelId, this.sessionId, this.token,
-                    this.endpoint, this.ssrc, this.voiceServerIp,
-                    this.voiceServerPort, this.hasServerUpdate, this.hasStateUpdate);
-        }
-
-        public boolean isReadyToConnect() {
-            return guildId != null && token != null && sessionId != null &&
-                    endpoint != null && hasServerUpdate && hasStateUpdate;
-        }
-
-        @Override
-        public boolean equals(Object obj) {
-            if (this == obj) return true;
-            if (!(obj instanceof VoiceConnectionState)) return false;
-            VoiceConnectionState other = (VoiceConnectionState) obj;
-            return java.util.Objects.equals(guildId, other.guildId) &&
-                    java.util.Objects.equals(channelId, other.channelId) &&
-                    java.util.Objects.equals(sessionId, other.sessionId) &&
-                    java.util.Objects.equals(token, other.token) &&
-                    java.util.Objects.equals(endpoint, other.endpoint) &&
-                    ssrc == other.ssrc &&
-                    hasServerUpdate == other.hasServerUpdate &&
-                    hasStateUpdate == other.hasStateUpdate;
-        }
-
-        @Override
-        public int hashCode() {
-            return java.util.Objects.hash(guildId, channelId, sessionId, token, endpoint,
-                    ssrc, hasServerUpdate, hasStateUpdate);
-        }
-
-        @Override
-        public String toString() {
-            return String.format("VoiceConnectionState{guild=%s, channel=%s, session=%s, " +
-                            "token=%s, endpoint=%s, ssrc=%d, serverUpdate=%s, stateUpdate=%s}",
-                    guildId, channelId, sessionId != null ? "***" : null,
-                    token != null ? "***" : null, endpoint, ssrc,
-                    hasServerUpdate, hasStateUpdate);
-        }
+    public OpusUdpStreamer getUdpStreamer() {
+        return udpStreamer;
     }
 }

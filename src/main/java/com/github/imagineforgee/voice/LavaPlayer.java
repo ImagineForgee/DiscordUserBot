@@ -11,26 +11,33 @@ import com.sedmelluq.discord.lavaplayer.track.AudioTrack;
 import com.sedmelluq.discord.lavaplayer.track.playback.AudioFrame;
 import dev.lavalink.youtube.YoutubeAudioSourceManager;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
-import java.io.IOException;
+import java.time.Duration;
 
 public class LavaPlayer implements VoiceMode {
     private final AudioPlayerManager playerManager;
     private final com.sedmelluq.discord.lavaplayer.player.AudioPlayer lavaPlayer;
-    private final OpusUdpStreamer streamer;
-	private final VoiceClient voiceClient;
+    private OpusUdpStreamer streamer;
+    private VoiceClient voiceClient;
 
-    public LavaPlayer(VoiceClient voiceClient, OpusUdpStreamer opusUdpStreamer) throws IOException {
-
+    public LavaPlayer(OpusUdpStreamer streamer) {
         this.playerManager = new DefaultAudioPlayerManager();
         this.playerManager.getConfiguration().setOutputFormat(StandardAudioDataFormats.DISCORD_OPUS);
         this.playerManager.registerSourceManager(new YoutubeAudioSourceManager(true));
-
-        this.voiceClient = voiceClient;
         this.lavaPlayer = playerManager.createPlayer();
-        this.streamer = opusUdpStreamer;
+        this.streamer = streamer;
     }
 
+    @Override
+    public void setVoiceClient(VoiceClient client) {
+        this.voiceClient = client;
+        if (client.getUdpStreamer() != null) {
+            this.streamer = client.getUdpStreamer();
+        }
+    }
+
+    @Override
     public void start(String url) {
         System.out.println("[Voice] Loading track: " + url);
         stopStreaming();
@@ -66,21 +73,36 @@ public class LavaPlayer implements VoiceMode {
 
     private void startAudioStream() {
         System.out.println("[Voice] Starting audio stream");
+
+        OpusUdpStreamer udpStreamer = voiceClient.getUdpStreamer();
+        if (udpStreamer == null) {
+            System.err.println("[LavaPlayer] Cannot start audio stream: streamer not set in VoiceClient");
+            return;
+        }
+
         stopStreaming();
 
-        Flux<byte[]> opusFrames = Flux.generate(sink -> {
-            AudioFrame frame = lavaPlayer.provide();
-            if (frame != null && frame.getData() != null && frame.getData().length > 0) {
-                sink.next(frame.getData());
-            }
-        });
+        Flux<byte[]> opusFrames = Flux.interval(Duration.ofMillis(20))
+                .onBackpressureDrop()
+                .takeWhile(tick -> voiceClient.getIsConnected().get())
+                .flatMap(tick -> {
+                    AudioFrame frame = lavaPlayer.provide();
+                    if (frame != null && frame.getData() != null && frame.getData().length > 0) {
+                        return Mono.just(frame.getData());
+                    }
+                    return Mono.empty();
+                });
 
         voiceClient.setSpeaking(SpeakingFlag.MICROPHONE);
-        streamer.start(opusFrames);
+        udpStreamer.start(opusFrames);
     }
+
+
+    @Override
     public void stop() {
         lavaPlayer.stopTrack();
         stopStreaming();
+        voiceClient.setSpeaking();
     }
 
     @Override
@@ -94,9 +116,13 @@ public class LavaPlayer implements VoiceMode {
     }
 
     private void stopStreaming() {
-        streamer.stop();
+        if (streamer != null) {
+            streamer.stop();
+            streamer = null;
+        }
     }
 
+    @Override
     public void shutdown() {
         stop();
         playerManager.shutdown();
@@ -105,5 +131,10 @@ public class LavaPlayer implements VoiceMode {
     @Override
     public boolean isActive() {
         return lavaPlayer.getPlayingTrack() != null;
+    }
+
+    @Override
+    public void setUdpStreamer(OpusUdpStreamer udpStreamer) {
+        this.streamer = udpStreamer;
     }
 }

@@ -37,19 +37,18 @@ public class OpusUdpStreamer {
         AtomicInteger seq = new AtomicInteger(0);
         AtomicInteger ts = new AtomicInteger((int) (System.currentTimeMillis() & 0xFFFFFFFF));
 
-        stop();
+        stop(); // cancel existing stream
 
-        this.stream = Flux.interval(Duration.ofMillis(20))
-                .zipWith(opusFrames)
-                .takeWhile(t -> isConnected.get())
-                .subscribeOn(Schedulers.boundedElastic())
-                .subscribe(tuple -> {
+        this.stream = opusFrames
+                .takeWhile(frame -> isConnected.get())
+                .subscribeOn(Schedulers.boundedElastic()) // run async
+                .subscribe(frame -> {
                     int sequence = seq.getAndUpdate(s -> (s + 1) & 0xFFFF);
-                    int timestamp = ts.getAndUpdate(t0 -> (t0 + 960) & 0xFFFFFFFF);
-                    byte[] frame = tuple.getT2();
+                    int timestamp = ts.getAndUpdate(t -> (t + 960) & 0xFFFFFFFF);
                     sendFrame(sequence, timestamp, frame);
                 });
     }
+
 
     private void sendFrame(int sequence, int timestamp, byte[] opusFrame) {
         try {

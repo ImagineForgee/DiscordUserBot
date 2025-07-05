@@ -3,6 +3,9 @@ package com.github.imagineforgee.bot;
 import com.clawsoftstudios.purrfectlib.scanner.CommandInfo;
 import com.clawsoftstudios.purrfectlib.scanner.CommandScanner;
 import com.github.imagineforgee.client.UserBotClient;
+import com.github.imagineforgee.client.VoiceClient;
+import com.github.imagineforgee.voice.LavaPlayer;
+import com.github.imagineforgee.voice.VoiceMode;
 import com.google.gson.*;
 import reactor.core.publisher.Mono;
 
@@ -84,9 +87,15 @@ public class Main {
         bot.connect()
                 .then(Mono.fromRunnable(() -> {
                     System.out.println("✅ Bot connected!");
-                    bot.sendRawMessage("1385461917115482242", payload);
+                    // bot.sendRawMessage("1385461917115482242", payload);
                     bot.startCommandListener();
                 }))
                 .subscribe();
+
+        VoiceClient voiceClient = bot.getVoiceClient();
+        VoiceMode lavaMode = new LavaPlayer(voiceClient.getUdpStreamer());
+        voiceClient.registerVoiceMode("lava", lavaMode);
+        voiceClient.switchToVoiceMode("lava");
+        lavaMode.setVoiceClient(voiceClient);
     }
 }

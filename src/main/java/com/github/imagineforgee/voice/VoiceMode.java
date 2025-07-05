@@ -1,7 +1,10 @@
 package com.github.imagineforgee.voice;
 
 
+import com.github.imagineforgee.client.VoiceClient;
+
 public interface VoiceMode {
+    default void setVoiceClient(VoiceClient client) {}
     void start(String url);
     void stop();
 
@@ -26,5 +29,6 @@ public interface VoiceMode {
      * Indicates whether this voice mode is currently active (e.g., playing or streaming).
      */
     boolean isActive();
+    void setUdpStreamer(OpusUdpStreamer udpStreamer);
 }
 

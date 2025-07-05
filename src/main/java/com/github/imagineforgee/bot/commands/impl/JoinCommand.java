@@ -3,11 +3,9 @@ package com.github.imagineforgee.bot.commands.impl;
 import com.clawsoftstudios.purrfectlib.annotations.Command;
 import com.github.imagineforgee.commands.CommandArgs;
 import com.github.imagineforgee.commands.CommandContext;
-import com.github.imagineforgee.dispatch.events.VoiceStateUpdateEvent;
-import com.github.imagineforgee.util.VoiceStateRegistry;
 import reactor.core.publisher.Mono;
 
-@Command(name = "join", description = "Join a voice channel", group = "music")
+@Command(name = "join", description = "Join a voice channel", group = "voice")
 public class JoinCommand {
     public void execute(CommandArgs args, CommandContext ctx) {
         String vcId = args.getKey("vc");
@@ -22,11 +20,10 @@ public class JoinCommand {
 
         ctx.getBot().getVoiceClient()
                 .joinAndConnect(ctx.getGuildId(), vcId)
+                .then(Mono.fromRunnable(() -> ctx.getBot().getVoiceClient().switchToVoiceMode("lava")))
                 .doOnSuccess(v -> ctx.reply("✅ Joined voice channel!"))
                 .doOnError(e -> ctx.reply("❌ Failed to join: " + e.getMessage()))
                 .subscribe();
-
-
     }
 }
 
